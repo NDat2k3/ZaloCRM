@@ -94,10 +94,8 @@ export async function webhookSettingsRoutes(app: FastifyInstance): Promise<void>
       const setting = await prisma.appSetting.findFirst({ where: { orgId, settingKey: 'public_api_key' } });
       if (!setting?.valuePlain) return { key: null };
 
-      const k = setting.valuePlain;
-      // Show prefix + first 8 chars + mask + last 4 chars
-      const masked = k.length > 12 ? `${k.slice(0, 12)}${'*'.repeat(k.length - 16)}${k.slice(-4)}` : `${k.slice(0, 4)}****`;
-      return { key: masked };
+      // Trả về key đầy đủ để hiển thị trên trang Cài đặt (CRM self-host 1 tổ chức, chỉ admin xem được).
+      return { key: setting.valuePlain };
     } catch (err) {
       logger.error('[webhook-settings] GET API key error:', err);
       return reply.status(500).send({ error: 'Failed to fetch API key' });

@@ -124,7 +124,7 @@ function showSnack(text: string, color = 'success') {
 async function loadApiKey() {
   try {
     const res = await api.get('/settings/api-key');
-    apiKey.value = res.data.apiKey ?? '';
+    apiKey.value = res.data.key ?? '';
   } catch {
     apiKey.value = '';
   }
@@ -159,7 +159,7 @@ async function generateKey() {
   generatingKey.value = true;
   try {
     const res = await api.post('/settings/api-key/generate');
-    apiKey.value = res.data.apiKey ?? '';
+    apiKey.value = res.data.key ?? '';
     showSnack('API key mới đã được tạo');
   } catch {
     showSnack('Tạo key thất bại', 'error');
