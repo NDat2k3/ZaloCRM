@@ -6,6 +6,14 @@
 import type { FastifyInstance, FastifyRequest, FastifyReply } from 'fastify';
 import { prisma } from '../../shared/database/prisma-client.js';
 import { logger } from '../../shared/utils/logger.js';
+import { assertSafeOutboundUrl, SsrfBlockedError } from '../../shared/utils/ssrf-guard.js';
+import { writeFile, unlink, mkdir } from 'node:fs/promises';
+import { randomUUID } from 'node:crypto';
+import os from 'node:os';
+import path from 'node:path';
+
+const IMAGE_SEND_MAX = 100 * 1024 * 1024; // 100MB
+const ALLOWED_IMAGE_MIME = ['image/jpeg', 'image/png', 'image/webp', 'image/gif'];
 
 // ── API key auth middleware ────────────────────────────────────────────────────
 
@@ -282,6 +290,86 @@ export async function publicApiRoutes(app: FastifyInstance): Promise<void> {
     } catch (err) {
       logger.error('[public-api] POST /messages/send error:', err);
       return reply.status(500).send({ error: 'Failed to send message' });
+    }
+  });
+
+  // ── Image send ────────────────────────────────────────────────────────────
+  // Gửi ảnh ra Zalo theo URL công khai (cho bot/n8n/Dify). Tải ảnh về tmp rồi
+  // gửi qua zca-js (attachments là đường dẫn local). Có SSRF guard + giới hạn type/size.
+  app.post('/api/public/messages/send-image', async (request: FastifyRequest, reply: FastifyReply) => {
+    const orgId = (request as any).orgId as string;
+    const body = request.body as Record<string, any>;
+
+    if (!body?.zaloAccountId || !body?.threadId || !(body?.imageUrl || body?.imageUrls)) {
+      return reply.status(400).send({ error: 'zaloAccountId, threadId, and imageUrl (or imageUrls) are required' });
+    }
+    const urls: string[] = Array.isArray(body.imageUrls) ? body.imageUrls : [body.imageUrl];
+    if (urls.length === 0 || urls.length > 9) {
+      return reply.status(400).send({ error: 'Provide 1 to 9 image URLs' });
+    }
+
+    // Verify account belongs to org + connected
+    const account = await prisma.zaloAccount.findFirst({
+      where: { id: body.zaloAccountId, orgId },
+      select: { id: true, status: true },
+    });
+    if (!account) return reply.status(404).send({ error: 'Zalo account not found' });
+    if (account.status !== 'connected') {
+      return reply.status(422).send({ error: 'Zalo account is not connected' });
+    }
+
+    const { zaloPool } = await import('../zalo/zalo-pool.js');
+    const api = zaloPool.getApi(body.zaloAccountId);
+    if (!api) return reply.status(422).send({ error: 'Zalo account not active in pool' });
+
+    const tmpDir = path.join(os.tmpdir(), 'zalocrm-pub-img');
+    await mkdir(tmpDir, { recursive: true });
+    const tmpPaths: string[] = [];
+    try {
+      for (const rawUrl of urls) {
+        // SSRF guard — chặn loopback/private/metadata host
+        let safeUrl: URL;
+        try {
+          safeUrl = assertSafeOutboundUrl(String(rawUrl));
+        } catch (err) {
+          if (err instanceof SsrfBlockedError) {
+            return reply.status(400).send({ error: `Blocked unsafe image URL: ${rawUrl}` });
+          }
+          throw err;
+        }
+
+        const res = await fetch(safeUrl.toString(), { signal: AbortSignal.timeout(20000) });
+        if (!res.ok) {
+          return reply.status(422).send({ error: `Failed to fetch image (HTTP ${res.status}): ${rawUrl}` });
+        }
+        const contentType = (res.headers.get('content-type') || '').split(';')[0].trim().toLowerCase();
+        if (contentType && !ALLOWED_IMAGE_MIME.includes(contentType)) {
+          return reply.status(415).send({ error: `Unsupported image type "${contentType}": ${rawUrl}` });
+        }
+        const buf = Buffer.from(await res.arrayBuffer());
+        if (buf.length > IMAGE_SEND_MAX) {
+          return reply.status(413).send({ error: `Image too large (>100MB): ${rawUrl}` });
+        }
+        const ext = contentType === 'image/png' ? '.png'
+          : contentType === 'image/webp' ? '.webp'
+          : contentType === 'image/gif' ? '.gif' : '.jpg';
+        const p = path.join(tmpDir, `${randomUUID()}${ext}`);
+        await writeFile(p, buf);
+        tmpPaths.push(p);
+      }
+
+      const threadType = body.threadType === 'group' ? 1 : 0;
+      const caption = typeof body.caption === 'string' ? body.caption : '';
+      // zca-js: gửi nhiều ảnh trong 1 lời gọi (attachments = mảng đường dẫn local)
+      await api.sendMessage({ msg: caption, attachments: tmpPaths }, body.threadId, threadType);
+
+      return { success: true, sent: tmpPaths.length };
+    } catch (err) {
+      logger.error('[public-api] POST /messages/send-image error:', err);
+      return reply.status(500).send({ error: 'Failed to send image' });
+    } finally {
+      // Dọn file tạm
+      await Promise.all(tmpPaths.map((p) => unlink(p).catch(() => {})));
     }
   });
 }
