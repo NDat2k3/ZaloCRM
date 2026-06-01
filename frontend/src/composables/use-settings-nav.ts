@@ -111,6 +111,7 @@ export const SETTINGS_GROUPS: SettingsGroup[] = [
     permission: 'owner',
     items: [
       { id: 'api', label: 'API Key & Webhook', icon: '🔌', route: '/settings/dev/api', permission: 'owner', aliases: ['webhook', 'api key'] },
+      { id: 'image-bank', label: 'Kho ảnh chatbot', icon: '🖼', route: '/settings/dev/image-bank', permission: 'owner', aliases: ['kho anh', 'image bank', 'anh'] },
       { id: 'public-token', label: 'Public API token', icon: '🎫', route: '/settings/dev/public-token', permission: 'owner', comingSoon: true },
       { id: 'feature-flags', label: 'Feature flags', icon: '🚩', route: '/settings/dev/feature-flags', permission: 'owner', comingSoon: true },
       { id: 'backup', label: 'Backup & Restore', icon: '💾', route: '/settings/dev/backup', permission: 'owner', comingSoon: true },

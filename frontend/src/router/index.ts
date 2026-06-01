@@ -112,6 +112,7 @@ const routes = [
 
       // 🛠 Dev & API
       { path: 'dev/api',           name: 'Settings.Api',          component: () => import('@/views/ApiSettingsView.vue') },
+      { path: 'dev/image-bank',    name: 'Settings.ImageBank',    component: () => import('@/views/ImageBankView.vue') },
       { path: 'dev/public-token',  name: 'Settings.PublicToken',  component: () => import('@/views/settings/SettingsComingSoon.vue'), props: { feature: 'public-token' } },
       { path: 'dev/feature-flags', name: 'Settings.FeatureFlags', component: () => import('@/views/settings/SettingsComingSoon.vue'), props: { feature: 'feature-flags' } },
       { path: 'dev/backup',        name: 'Settings.Backup',       component: () => import('@/views/settings/SettingsComingSoon.vue'), props: { feature: 'backup' } },

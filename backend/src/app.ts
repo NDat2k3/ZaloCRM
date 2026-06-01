@@ -200,6 +200,8 @@ async function bootstrap() {
   await app.register(searchRoutes);
   await app.register(publicApiRoutes);
   await app.register(webhookSettingsRoutes);
+  const { imageBankRoutes } = await import('./modules/api/image-bank-routes.js');
+  await app.register(imageBankRoutes);
   await app.register(analyticsRoutes);
   await app.register(savedReportRoutes);
   await app.register(integrationRoutes);

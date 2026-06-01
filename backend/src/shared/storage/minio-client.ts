@@ -34,9 +34,10 @@ export interface UploadResult {
   mimeType: string;
 }
 
-export async function uploadBuffer(buffer: Buffer, mimeType: string, originalName?: string): Promise<UploadResult> {
+export async function uploadBuffer(buffer: Buffer, mimeType: string, originalName?: string, prefix?: string): Promise<UploadResult> {
   const ext = originalName ? extname(originalName) : mimeToExt(mimeType);
-  const key = `${new Date().toISOString().slice(0, 10)}/${randomUUID()}${ext}`;
+  const folder = prefix ? `${prefix.replace(/\/+$/, '')}/` : '';
+  const key = `${folder}${new Date().toISOString().slice(0, 10)}/${randomUUID()}${ext}`;
   await minioClient.putObject(BUCKET, key, buffer, buffer.length, {
     'Content-Type': mimeType,
     'Cache-Control': 'public, max-age=31536000',
@@ -47,6 +48,34 @@ export async function uploadBuffer(buffer: Buffer, mimeType: string, originalNam
     size: buffer.length,
     mimeType,
   };
+}
+
+export interface StoredObject {
+  key: string;
+  url: string;
+  size: number;
+  lastModified: Date;
+}
+
+/** Liệt kê object trong bucket theo prefix (dùng cho Kho ảnh chatbot). */
+export async function listObjectsByPrefix(prefix: string): Promise<StoredObject[]> {
+  const out: StoredObject[] = [];
+  const stream = minioClient.listObjectsV2(BUCKET, prefix, true);
+  for await (const obj of stream as AsyncIterable<{ name?: string; size?: number; lastModified?: Date }>) {
+    if (!obj.name) continue;
+    out.push({
+      key: obj.name,
+      url: `${config.s3PublicUrl}/${BUCKET}/${obj.name}`,
+      size: obj.size ?? 0,
+      lastModified: obj.lastModified ?? new Date(0),
+    });
+  }
+  return out;
+}
+
+/** Xóa 1 object khỏi bucket theo key. */
+export async function deleteObject(key: string): Promise<void> {
+  await minioClient.removeObject(BUCKET, key);
 }
 
 function mimeToExt(mime: string): string {
