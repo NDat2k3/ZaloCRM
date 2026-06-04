@@ -836,74 +836,83 @@ export async function chatRoutes(app: FastifyInstance) {
     });
     if (!conversation) return reply.status(404).send({ error: 'Conversation not found' });
 
-    // Build filter — sentAt range + optional sender
-    const where: any = { conversationId: id, isDeleted: false };
-    if (from || to) {
-      where.sentAt = {};
-      if (from) where.sentAt.gte = new Date(from);
-      if (to) {
-        // 'to' tính trọn ngày: nếu chỉ có ngày (YYYY-MM-DD) → cộng tới cuối ngày
-        const toDate = new Date(to);
-        if (/^\d{4}-\d{2}-\d{2}$/.test(to)) toDate.setHours(23, 59, 59, 999);
-        where.sentAt.lte = toDate;
+    try {
+      // Build filter — sentAt range + optional sender
+      const where: any = { conversationId: id, isDeleted: false };
+      if (from || to) {
+        where.sentAt = {};
+        if (from) where.sentAt.gte = new Date(from);
+        if (to) {
+          // 'to' tính trọn ngày: nếu chỉ có ngày (YYYY-MM-DD) → cộng tới cuối ngày
+          const toDate = new Date(to);
+          if (/^\d{4}-\d{2}-\d{2}$/.test(to)) toDate.setHours(23, 59, 59, 999);
+          where.sentAt.lte = toDate;
+        }
       }
+      if (senderUid) where.senderUid = senderUid;
+
+      const rows = await prisma.message.findMany({
+        where,
+        orderBy: [{ zaloMsgIdNum: { sort: 'asc', nulls: 'last' } }, { sentAt: 'asc' }],
+        take: EXPORT_MAX_MESSAGES,
+        select: {
+          senderUid: true, senderName: true, content: true, contentType: true,
+          senderType: true, sentAt: true,
+        },
+      });
+
+      // Privacy redact — non-owner main-nick conv sẽ ra ▒▒▒ (tôn trọng quyền riêng tư)
+      const { buildPrivacyContext, redactMessage } = await import('../privacy/redact.js');
+      const privacyCtx = await buildPrivacyContext(request);
+      const redacted = rows.map((m) => redactMessage(m as any, conversation as any, privacyCtx));
+
+      // Chuẩn hoá thành các dòng [Thời gian, Người gửi, Loại tin, Nội dung]
+      const records = redacted.map((m: any) => ({
+        time: formatExportTime(m.sentAt),
+        sender: m.senderType === 'self' ? 'Tôi (nick)' : (m.senderName || m.senderUid || 'Không rõ'),
+        type: EXPORT_CONTENT_TYPE_LABEL[m.contentType] ?? m.contentType,
+        content: formatExportContent(m.content, m.contentType),
+      }));
+
+      // Tên file PHẢI là ASCII — HTTP header không nhận ký tự có dấu (Node ném ERR_INVALID_CHAR).
+      // → bỏ dấu tiếng Việt + đ/Đ, ký tự lạ thành '-'.
+      const rawName = conversation.contact?.fullName || conversation.externalThreadId || 'hoi-thoai';
+      const safeName = (rawName.normalize('NFD').replace(/[̀-ͯ]/g, '')
+        .replace(/[đĐ]/g, 'd')
+        .replace(/[^a-zA-Z0-9_-]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 60)) || 'hoi-thoai';
+      const dateTag = `${from || 'dau'}_${to || 'nay'}`;
+
+      if (format === 'csv') {
+        const header = ['Thời gian', 'Người gửi', 'Loại tin', 'Nội dung'].join(',');
+        const body = records.map((r) => [r.time, r.sender, r.type, r.content].map(csvCell).join(',')).join('\r\n');
+        const csv = '﻿' + header + '\r\n' + body; // BOM cho Excel đọc tiếng Việt đúng
+        reply.header('Content-Type', 'text/csv; charset=utf-8');
+        reply.header('Content-Disposition', `attachment; filename="tin-nhan_${safeName}_${dateTag}.csv"`);
+        return reply.send(csv);
+      }
+
+      // Mặc định: Excel .xlsx
+      const workbook = new ExcelJS.Workbook();
+      const sheet = workbook.addWorksheet('Tin nhắn');
+      sheet.columns = [
+        { header: 'Thời gian', key: 'time', width: 22 },
+        { header: 'Người gửi', key: 'sender', width: 24 },
+        { header: 'Loại tin', key: 'type', width: 14 },
+        { header: 'Nội dung', key: 'content', width: 80 },
+      ];
+      sheet.getRow(1).font = { bold: true };
+      sheet.getRow(1).alignment = { vertical: 'middle' };
+      for (const r of records) sheet.addRow(r);
+      sheet.getColumn('content').alignment = { wrapText: true, vertical: 'top' };
+
+      const buffer = await workbook.xlsx.writeBuffer();
+      reply.header('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+      reply.header('Content-Disposition', `attachment; filename="tin-nhan_${safeName}_${dateTag}.xlsx"`);
+      return reply.send(Buffer.from(buffer as ArrayBuffer));
+    } catch (err) {
+      logger.error('[chat] Export messages error:', err);
+      return reply.status(500).send({ error: 'Xuất tin nhắn thất bại' });
     }
-    if (senderUid) where.senderUid = senderUid;
-
-    const rows = await prisma.message.findMany({
-      where,
-      orderBy: [{ zaloMsgIdNum: { sort: 'asc', nulls: 'last' } }, { sentAt: 'asc' }],
-      take: EXPORT_MAX_MESSAGES,
-      select: {
-        senderUid: true, senderName: true, content: true, contentType: true,
-        senderType: true, sentAt: true,
-      },
-    });
-
-    // Privacy redact — non-owner main-nick conv sẽ ra ▒▒▒ (tôn trọng quyền riêng tư)
-    const { buildPrivacyContext, redactMessage } = await import('../privacy/redact.js');
-    const privacyCtx = await buildPrivacyContext(request);
-    const redacted = rows.map((m) => redactMessage(m as any, conversation as any, privacyCtx));
-
-    // Chuẩn hoá thành các dòng [Thời gian, Người gửi, Loại tin, Nội dung]
-    const records = redacted.map((m: any) => ({
-      time: formatExportTime(m.sentAt),
-      sender: m.senderType === 'self' ? 'Tôi (nick)' : (m.senderName || m.senderUid || 'Không rõ'),
-      type: EXPORT_CONTENT_TYPE_LABEL[m.contentType] ?? m.contentType,
-      content: formatExportContent(m.content, m.contentType),
-    }));
-
-    const safeName = (conversation.contact?.fullName || conversation.externalThreadId || 'hoi-thoai')
-      .replace(/[^\p{L}\p{N}_-]+/gu, '-').slice(0, 60);
-    const dateTag = `${from || 'dau'}_${to || 'nay'}`;
-
-    if (format === 'csv') {
-      const header = ['Thời gian', 'Người gửi', 'Loại tin', 'Nội dung'].join(',');
-      const body = records.map((r) => [r.time, r.sender, r.type, r.content].map(csvCell).join(',')).join('\r\n');
-      const csv = '﻿' + header + '\r\n' + body; // BOM cho Excel đọc tiếng Việt đúng
-      reply.header('Content-Type', 'text/csv; charset=utf-8');
-      reply.header('Content-Disposition', `attachment; filename="tin-nhan_${safeName}_${dateTag}.csv"`);
-      return reply.send(csv);
-    }
-
-    // Mặc định: Excel .xlsx
-    const workbook = new ExcelJS.Workbook();
-    const sheet = workbook.addWorksheet('Tin nhắn');
-    sheet.columns = [
-      { header: 'Thời gian', key: 'time', width: 22 },
-      { header: 'Người gửi', key: 'sender', width: 24 },
-      { header: 'Loại tin', key: 'type', width: 14 },
-      { header: 'Nội dung', key: 'content', width: 80 },
-    ];
-    sheet.getRow(1).font = { bold: true };
-    sheet.getRow(1).alignment = { vertical: 'middle' };
-    for (const r of records) sheet.addRow(r);
-    sheet.getColumn('content').alignment = { wrapText: true, vertical: 'top' };
-
-    const buffer = await workbook.xlsx.writeBuffer();
-    reply.header('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
-    reply.header('Content-Disposition', `attachment; filename="tin-nhan_${safeName}_${dateTag}.xlsx"`);
-    return reply.send(Buffer.from(buffer as ArrayBuffer));
   });
 
   // ── Danh sách người gửi trong hội thoại (cho dropdown lọc khi export) ───────
