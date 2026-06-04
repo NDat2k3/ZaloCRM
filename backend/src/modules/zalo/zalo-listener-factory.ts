@@ -435,6 +435,8 @@ export function attachZaloListener(ctx: ListenerContext): void {
         isSelf: message.isSelf || false,
         threadId: message.threadId || '',
         threadType: isGroup ? 'group' : 'user',
+        // Mention/tag info (tin group) — bot dùng để chỉ trả lời khi được @tag đích danh
+        mentions: Array.isArray(message.data?.mentions) ? message.data.mentions : undefined,
         recipientName: recipientName || undefined,
         contactGlobalId: contactGlobalId || undefined,
         contactUsername: contactUsername || undefined,

@@ -36,6 +36,9 @@ export interface IncomingMessage {
   groupName?: string;       // group name if group message
   groupAvatarUrl?: string;  // group avatar URL from Zalo (via getGroupInfo.avt)
   groupMembersCount?: number; // total members in group
+  // Mention/tag info cho tin group — dùng để bot chỉ trả lời khi được @tag đích danh.
+  // Mỗi mention: { uid, pos, len }. @all (tag tất cả) Zalo dùng uid = "-1".
+  mentions?: Array<{ uid: string; pos: number; len: number }>;
   attachments?: any[];
   quote?: unknown;
   albumKey?: string | null;
@@ -229,7 +232,7 @@ export async function handleIncomingMessage(
   try {
     const account = await prisma.zaloAccount.findUnique({
       where: { id: msg.accountId },
-      select: { orgId: true, ownerUserId: true },
+      select: { orgId: true, ownerUserId: true, zaloUid: true },
     });
     if (!account) return null;
 
@@ -480,7 +483,16 @@ export async function handleIncomingMessage(
       };
     }
 
+    // DEBUG (tạm 2026-06-04): log mentions tin group để xác minh cấu trúc @tag + @all.
+    // Bỏ sau khi xác nhận quy tắc bot hoạt động đúng.
+    if (msg.threadType === 'group' && !msg.isSelf) {
+      logger.info(`[mention-debug] group=${msg.threadId} selfUid=${account.zaloUid} mentions=`, JSON.stringify(msg.mentions ?? null));
+    }
+
     // Emit webhook for message event (fire-and-forget)
+    // Bổ sung threadType/threadId/mentions/selfUid để n8n quyết định:
+    //  - user (DM): luôn trả lời, gửi về senderUid
+    //  - group: chỉ trả lời khi mentions chứa selfUid (tag đích danh bot) và KHÔNG phải @all (uid "-1")
     emitWebhook(account.orgId, msg.isSelf ? 'message.sent' : 'message.received', {
       messageId: message.id,
       conversationId: conversation.id,
@@ -488,6 +500,10 @@ export async function handleIncomingMessage(
       content: msg.content,
       contentType: msg.contentType,
       sentAt: message.sentAt,
+      threadType: msg.threadType,
+      threadId: msg.threadId,
+      selfUid: account.zaloUid,
+      mentions: msg.mentions ?? [],
     });
 
     if (!msg.isSelf) {
