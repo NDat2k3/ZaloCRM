@@ -224,6 +224,8 @@
               <button class="icon-btn" v-bind="act" title="Thêm">⋮</button>
             </template>
             <v-list density="compact" min-width="220">
+              <v-list-item prepend-icon="mdi-download" title="⬇ Tải tin nhắn (Excel/CSV)" @click="openExportDialog" />
+              <v-divider />
               <v-list-item prepend-icon="mdi-history" title="Lịch sử hội thoại" @click="toast.push('Lịch sử: chưa implement')" />
               <v-list-item prepend-icon="mdi-magnify" title="Tìm trong hội thoại" @click="toast.push('Tìm: chưa implement')" />
               <v-list-item prepend-icon="mdi-note-edit-outline" title="Ghi chú nhanh" @click="onOpenNote" />
@@ -612,6 +614,42 @@
       v-model="privacyViewerOpen"
       :nick="privacyDialogNick"
     />
+
+    <!-- Tải tin nhắn ra file (Excel/CSV) — lọc theo thời gian + người gửi -->
+    <v-dialog v-model="showExportDialog" max-width="460">
+      <v-card>
+        <v-card-title class="text-subtitle-1 font-weight-bold">⬇ Tải tin nhắn</v-card-title>
+        <v-card-text>
+          <div class="text-caption text-medium-emphasis mb-3">
+            Xuất tin nhắn của hội thoại này ra file. Để trống ngày = lấy toàn bộ.
+          </div>
+          <div class="d-flex gap-2 mb-3">
+            <v-text-field
+              v-model="exportFrom" type="date" label="Từ ngày" density="compact"
+              variant="outlined" hide-details clearable
+            />
+            <v-text-field
+              v-model="exportTo" type="date" label="Đến ngày" density="compact"
+              variant="outlined" hide-details clearable
+            />
+          </div>
+          <v-select
+            v-model="exportSender" :items="senderItems" item-title="label" item-value="value"
+            label="Người gửi" density="compact" variant="outlined" hide-details
+            :loading="sendersLoading" class="mb-3"
+          />
+          <v-radio-group v-model="exportFormat" inline hide-details density="compact" class="mt-1">
+            <v-radio label="Excel (.xlsx)" value="xlsx" />
+            <v-radio label="CSV" value="csv" />
+          </v-radio-group>
+        </v-card-text>
+        <v-card-actions>
+          <v-spacer />
+          <v-btn variant="text" @click="showExportDialog = false">Huỷ</v-btn>
+          <v-btn color="primary" :loading="exportLoading" @click="doExport">Tải về</v-btn>
+        </v-card-actions>
+      </v-card>
+    </v-dialog>
   </div>
 </template>
 
@@ -1624,6 +1662,81 @@ async function fireWebhook() {
     toast.error('Webhook fail');
   } finally {
     webhookLoading.value = false;
+  }
+}
+
+// ── Tải tin nhắn ra file (Excel/CSV) ───────────────────────────────────────
+const showExportDialog = ref(false);
+const exportFrom = ref<string>('');
+const exportTo = ref<string>('');
+const exportSender = ref<string>('');        // '' = tất cả
+const exportFormat = ref<'xlsx' | 'csv'>('xlsx');
+const exportLoading = ref(false);
+const sendersLoading = ref(false);
+const senders = ref<Array<{ senderUid: string | null; senderName: string; count: number }>>([]);
+
+const senderItems = computed(() => [
+  { label: 'Tất cả người gửi', value: '' },
+  ...senders.value.map((s) => ({
+    label: `${s.senderName} (${s.count})`,
+    value: s.senderUid ?? '',
+  })).filter((s) => s.value !== ''),
+]);
+
+async function openExportDialog() {
+  if (!props.conversation?.id) return;
+  exportFrom.value = '';
+  exportTo.value = '';
+  exportSender.value = '';
+  exportFormat.value = 'xlsx';
+  showExportDialog.value = true;
+  // Nạp danh sách người gửi để lọc
+  sendersLoading.value = true;
+  senders.value = [];
+  try {
+    const { data } = await api.get(`/conversations/${props.conversation.id}/senders`);
+    senders.value = data.senders ?? [];
+  } catch {
+    // không chặn — vẫn export "tất cả" được
+  } finally {
+    sendersLoading.value = false;
+  }
+}
+
+async function doExport() {
+  if (!props.conversation?.id) return;
+  exportLoading.value = true;
+  try {
+    const params: Record<string, string> = { format: exportFormat.value };
+    if (exportFrom.value) params.from = exportFrom.value;
+    if (exportTo.value) params.to = exportTo.value;
+    if (exportSender.value) params.senderUid = exportSender.value;
+
+    const res = await api.get(`/conversations/${props.conversation.id}/messages/export`, {
+      params,
+      responseType: 'blob',
+    });
+
+    // Lấy tên file từ header Content-Disposition (fallback nếu không có)
+    const disp = res.headers['content-disposition'] || '';
+    const match = /filename="?([^"]+)"?/.exec(disp);
+    const filename = match?.[1] || `tin-nhan.${exportFormat.value}`;
+
+    const url = URL.createObjectURL(res.data as Blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+
+    toast.success('Đã tải tin nhắn');
+    showExportDialog.value = false;
+  } catch (err: any) {
+    toast.error(err?.response?.data?.error || 'Tải tin nhắn thất bại');
+  } finally {
+    exportLoading.value = false;
   }
 }
 

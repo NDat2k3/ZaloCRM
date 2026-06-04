@@ -15,9 +15,15 @@ import { handleIncomingMessage } from '../chat/message-handler.js';
 import { detectContentType, extractAlbumInfo } from './zalo-message-helpers.js';
 
 const MAX_GROUPS = 50;
-const MESSAGES_PER_GROUP = 50;
+// Nâng 50→300 (2026-06-04): kho tin dày hơn để export. Zalo có thể trả về ít hơn
+// nếu group không đủ tin. Đọc lịch sử là thao tác rủi ro thấp, nhưng vẫn thêm
+// GROUP_SYNC_DELAY_MS giữa các group để mô phỏng hành vi tự nhiên, giảm rủi ro gắn cờ.
+const MESSAGES_PER_GROUP = 300;
+const GROUP_SYNC_DELAY_MS = 500;
 const DM_MAX_PAGES = 50;
 const DM_PAGE_TIMEOUT_MS = 15_000;
+
+const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
 /**
  * Multi-cursor strategy ported from openzca CLI `getRecentPageCursors`.
@@ -300,6 +306,8 @@ export async function backfillAccountHistory(api: any, accountId: string): Promi
       result.errors++;
       logger.warn(`[backfill:${accountId}] Group ${groupId} history fetch failed:`, err);
     }
+    // Nghỉ ngắn giữa các group — tránh dồn dập gọi API Zalo (giảm rủi ro gắn cờ).
+    await sleep(GROUP_SYNC_DELAY_MS);
   }
 
   // ── 3. DM history via requestOldMessages pagination ────────────────────

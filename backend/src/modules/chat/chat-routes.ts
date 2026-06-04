@@ -12,8 +12,54 @@ import { logger } from '../../shared/utils/logger.js';
 import { randomUUID } from 'node:crypto';
 import type { Server } from 'socket.io';
 import { applyContactAggregateFromMessage, applyFriendAggregate } from '../contacts/contact-aggregate.js';
+import ExcelJS from 'exceljs';
 
 type QueryParams = Record<string, string>;
+
+// ── Export helpers ──────────────────────────────────────────────────────────
+// Số tin tối đa cho 1 lần export — chặn truy vấn quá lớn làm nghẽn server.
+const EXPORT_MAX_MESSAGES = 20000;
+
+// Nhãn tiếng Việt cho loại tin (cột "Loại tin" trong file export).
+const EXPORT_CONTENT_TYPE_LABEL: Record<string, string> = {
+  text: 'Văn bản', image: 'Hình ảnh', file: 'Tệp', video: 'Video', voice: 'Tin thoại',
+  sticker: 'Sticker', gif: 'GIF', link: 'Liên kết', location: 'Vị trí',
+  contact_card: 'Danh thiếp', bank_transfer: 'Chuyển khoản', call: 'Cuộc gọi',
+  qr_code: 'Mã QR', reminder: 'Nhắc hẹn', poll: 'Bình chọn', note: 'Ghi chú', forwarded: 'Chuyển tiếp',
+};
+
+// Nội dung phi-text (image/file/...) lưu dưới dạng JSON → đổi sang mô tả ngắn dễ đọc.
+function formatExportContent(content: string | null, contentType: string): string {
+  const raw = content ?? '';
+  if (contentType === 'text') return raw;
+  if (raw.startsWith('{') || raw.startsWith('[')) {
+    try {
+      const p = JSON.parse(raw);
+      const label = EXPORT_CONTENT_TYPE_LABEL[contentType] ?? contentType;
+      const extra = p.name || p.title || p.description || p.href || '';
+      return extra ? `[${label}] ${extra}` : `[${label}]`;
+    } catch { /* fall through */ }
+  }
+  return raw;
+}
+
+// Format thời gian theo múi giờ VN cho dễ đọc trong Excel.
+function formatExportTime(d: Date): string {
+  try {
+    return new Intl.DateTimeFormat('vi-VN', {
+      timeZone: 'Asia/Ho_Chi_Minh', year: 'numeric', month: '2-digit', day: '2-digit',
+      hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false,
+    }).format(d);
+  } catch {
+    return d.toISOString();
+  }
+}
+
+// Escape 1 ô CSV (bọc ngoặc kép nếu chứa dấu phẩy / xuống dòng / ngoặc kép).
+function csvCell(v: string): string {
+  if (/[",\n\r]/.test(v)) return `"${v.replace(/"/g, '""')}"`;
+  return v;
+}
 
 function mapReplyMsgType(contentType: string): string {
   if (contentType === 'text') return 'webchat';
@@ -766,6 +812,138 @@ export async function chatRoutes(app: FastifyInstance) {
       return { ...r, zaloMsgIdNum: (r as any).zaloMsgIdNum?.toString() ?? null };
     });
     return { messages: redacted, total, page: parseInt(page), limit: parseInt(limit) };
+  });
+
+  // ── Export messages (xlsx / csv) ───────────────────────────────────────────
+  // Tải tin nhắn của 1 hội thoại ra file. Lọc theo from/to (ngày) + senderUid (tùy chọn).
+  // Đọc thẳng từ DB → không giới hạn 50 như Sync; chặn trần EXPORT_MAX_MESSAGES.
+  app.get('/api/v1/conversations/:id/messages/export', {
+    preHandler: requireZaloAccess('read'),
+    config: { contentClass: 'content' as const, rbacResource: 'conversation' as const, rbacAction: 'access' as const },
+  }, async (request: FastifyRequest, reply: FastifyReply) => {
+    const user = request.user!;
+    const { id } = request.params as { id: string };
+    const { from, to, senderUid, format = 'xlsx' } = request.query as QueryParams;
+
+    const conversation = await prisma.conversation.findFirst({
+      where: { id, orgId: user.orgId },
+      select: {
+        id: true,
+        externalThreadId: true,
+        contact: { select: { fullName: true } },
+        zaloAccount: { select: { privacyMode: true, ownerUserId: true } },
+      },
+    });
+    if (!conversation) return reply.status(404).send({ error: 'Conversation not found' });
+
+    // Build filter — sentAt range + optional sender
+    const where: any = { conversationId: id, isDeleted: false };
+    if (from || to) {
+      where.sentAt = {};
+      if (from) where.sentAt.gte = new Date(from);
+      if (to) {
+        // 'to' tính trọn ngày: nếu chỉ có ngày (YYYY-MM-DD) → cộng tới cuối ngày
+        const toDate = new Date(to);
+        if (/^\d{4}-\d{2}-\d{2}$/.test(to)) toDate.setHours(23, 59, 59, 999);
+        where.sentAt.lte = toDate;
+      }
+    }
+    if (senderUid) where.senderUid = senderUid;
+
+    const rows = await prisma.message.findMany({
+      where,
+      orderBy: [{ zaloMsgIdNum: { sort: 'asc', nulls: 'last' } }, { sentAt: 'asc' }],
+      take: EXPORT_MAX_MESSAGES,
+      select: {
+        senderUid: true, senderName: true, content: true, contentType: true,
+        senderType: true, sentAt: true,
+      },
+    });
+
+    // Privacy redact — non-owner main-nick conv sẽ ra ▒▒▒ (tôn trọng quyền riêng tư)
+    const { buildPrivacyContext, redactMessage } = await import('../privacy/redact.js');
+    const privacyCtx = await buildPrivacyContext(request);
+    const redacted = rows.map((m) => redactMessage(m as any, conversation as any, privacyCtx));
+
+    // Chuẩn hoá thành các dòng [Thời gian, Người gửi, Loại tin, Nội dung]
+    const records = redacted.map((m: any) => ({
+      time: formatExportTime(m.sentAt),
+      sender: m.senderType === 'self' ? 'Tôi (nick)' : (m.senderName || m.senderUid || 'Không rõ'),
+      type: EXPORT_CONTENT_TYPE_LABEL[m.contentType] ?? m.contentType,
+      content: formatExportContent(m.content, m.contentType),
+    }));
+
+    const safeName = (conversation.contact?.fullName || conversation.externalThreadId || 'hoi-thoai')
+      .replace(/[^\p{L}\p{N}_-]+/gu, '-').slice(0, 60);
+    const dateTag = `${from || 'dau'}_${to || 'nay'}`;
+
+    if (format === 'csv') {
+      const header = ['Thời gian', 'Người gửi', 'Loại tin', 'Nội dung'].join(',');
+      const body = records.map((r) => [r.time, r.sender, r.type, r.content].map(csvCell).join(',')).join('\r\n');
+      const csv = '﻿' + header + '\r\n' + body; // BOM cho Excel đọc tiếng Việt đúng
+      reply.header('Content-Type', 'text/csv; charset=utf-8');
+      reply.header('Content-Disposition', `attachment; filename="tin-nhan_${safeName}_${dateTag}.csv"`);
+      return reply.send(csv);
+    }
+
+    // Mặc định: Excel .xlsx
+    const workbook = new ExcelJS.Workbook();
+    const sheet = workbook.addWorksheet('Tin nhắn');
+    sheet.columns = [
+      { header: 'Thời gian', key: 'time', width: 22 },
+      { header: 'Người gửi', key: 'sender', width: 24 },
+      { header: 'Loại tin', key: 'type', width: 14 },
+      { header: 'Nội dung', key: 'content', width: 80 },
+    ];
+    sheet.getRow(1).font = { bold: true };
+    sheet.getRow(1).alignment = { vertical: 'middle' };
+    for (const r of records) sheet.addRow(r);
+    sheet.getColumn('content').alignment = { wrapText: true, vertical: 'top' };
+
+    const buffer = await workbook.xlsx.writeBuffer();
+    reply.header('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+    reply.header('Content-Disposition', `attachment; filename="tin-nhan_${safeName}_${dateTag}.xlsx"`);
+    return reply.send(Buffer.from(buffer as ArrayBuffer));
+  });
+
+  // ── Danh sách người gửi trong hội thoại (cho dropdown lọc khi export) ───────
+  app.get('/api/v1/conversations/:id/senders', {
+    preHandler: requireZaloAccess('read'),
+  }, async (request: FastifyRequest, reply: FastifyReply) => {
+    const user = request.user!;
+    const { id } = request.params as { id: string };
+
+    const conversation = await prisma.conversation.findFirst({
+      where: { id, orgId: user.orgId },
+      select: { id: true },
+    });
+    if (!conversation) return reply.status(404).send({ error: 'Conversation not found' });
+
+    // Gom theo senderUid, lấy tên hiển thị gần nhất + số tin
+    const grouped = await prisma.message.groupBy({
+      by: ['senderUid', 'senderName', 'senderType'],
+      where: { conversationId: id, isDeleted: false },
+      _count: { _all: true },
+      orderBy: { _count: { senderUid: 'desc' } },
+      take: 200,
+    });
+
+    // Dedup theo senderUid (1 người có thể đổi tên hiển thị → gộp, giữ tên đầu)
+    const map = new Map<string, { senderUid: string | null; senderName: string; senderType: string; count: number }>();
+    for (const g of grouped) {
+      const key = g.senderUid ?? `self:${g.senderType}`;
+      const existing = map.get(key);
+      if (existing) { existing.count += g._count._all; }
+      else {
+        map.set(key, {
+          senderUid: g.senderUid,
+          senderName: g.senderType === 'self' ? 'Tôi (nick)' : (g.senderName || g.senderUid || 'Không rõ'),
+          senderType: g.senderType,
+          count: g._count._all,
+        });
+      }
+    }
+    return { senders: [...map.values()].sort((a, b) => b.count - a.count) };
   });
 
   // ── Send message ─────────────────────────────────────────────────────────
